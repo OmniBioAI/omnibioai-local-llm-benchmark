@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Sequential local Ollama scientific-model evaluation for OmniBioAI.
+Includes Qwen3.5 122B in the default model inventory.
 
 Runs one model at a time against the same fixed scientific prompt set.
 Writes raw responses and timing/token metrics to JSONL and CSV files.
@@ -20,6 +21,7 @@ from pathlib import Path
 
 DEFAULT_MODELS = [
     "gpt-oss:120b",
+    "qwen3.5:122b",
     "hf.co/DuoNeural/medgemma-1.5-4b-it-LiteRT:Q4_K_M",
     "phi4:14b",
     "qwen3:14b",
@@ -124,166 +126,3 @@ def check_server(base_url, timeout):
     except Exception as exc:
         raise SystemExit(
             f"Cannot reach Ollama at {base_url}. "
-            f"Check that the Ollama API is listening. Details: {exc}"
-        )
-
-
-def run_case(base_url, model, case, args):
-    payload = {
-        "model": model,
-        "prompt": case["prompt"],
-        "stream": False,
-        "keep_alive": 0,  # unload after each request to limit memory pressure
-        "options": {
-            "temperature": 0,
-            "seed": 42,
-            "num_ctx": args.context,
-            "num_predict": args.max_tokens,
-        },
-    }
-
-    started = time.perf_counter()
-    try:
-        result = post_json(
-            base_url.rstrip("/") + "/api/generate",
-            payload,
-            args.timeout,
-        )
-        wall_seconds = time.perf_counter() - started
-        eval_count = result.get("eval_count", 0) or 0
-        eval_duration = result.get("eval_duration", 0) or 0
-        tokens_per_second = (
-            eval_count / (eval_duration / 1e9)
-            if eval_duration > 0 else None
-        )
-        return {
-            "status": "ok",
-            "wall_seconds": round(wall_seconds, 3),
-            "load_seconds": round((result.get("load_duration", 0) or 0) / 1e9, 3),
-            "prompt_tokens": result.get("prompt_eval_count"),
-            "generated_tokens": eval_count,
-            "generation_seconds": round(eval_duration / 1e9, 3),
-            "tokens_per_second": round(tokens_per_second, 2)
-                if tokens_per_second is not None else None,
-            "response": result.get("response", ""),
-            "error": "",
-        }
-    except Exception as exc:
-        return {
-            "status": "error",
-            "wall_seconds": round(time.perf_counter() - started, 3),
-            "load_seconds": None,
-            "prompt_tokens": None,
-            "generated_tokens": None,
-            "generation_seconds": None,
-            "tokens_per_second": None,
-            "response": "",
-            "error": str(exc),
-        }
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Run a sequential scientific benchmark against local Ollama models."
-    )
-    parser.add_argument("--url", default="http://localhost:11434",
-                        help="Ollama API base URL (default: http://localhost:11434)")
-    parser.add_argument("--output-dir", default="omnibioai-model-eval",
-                        help="Directory for CSV and JSONL results")
-    parser.add_argument("--context", type=int, default=8192,
-                        help="Context window for every model (default: 8192)")
-    parser.add_argument("--max-tokens", type=int, default=512,
-                        help="Maximum generated tokens per test (default: 512)")
-    parser.add_argument("--timeout", type=int, default=3600,
-                        help="Per-request timeout in seconds (default: 3600)")
-    parser.add_argument("--pause", type=float, default=2.0,
-                        help="Pause between model tests in seconds (default: 2)")
-    parser.add_argument("--repeats", type=int, default=1,
-                        help="Repeat each case per model (default: 1)")
-    parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS,
-                        help="Optional explicit model list; defaults to dashboard inventory")
-    parser.add_argument("--skip-missing", action="store_true",
-                        help="Skip models not currently present in Ollama")
-    args = parser.parse_args()
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    jsonl_path = output_dir / f"results_{stamp}.jsonl"
-    csv_path = output_dir / f"results_{stamp}.csv"
-
-    available = check_server(args.url, args.timeout)
-    print(f"Ollama reachable: {args.url}")
-    print(f"Models reported by Ollama: {len(available)}")
-    print(f"Scientific cases: {len(CASES)} | repeats: {args.repeats}")
-    print(f"Sequential execution; context={args.context}, max_tokens={args.max_tokens}")
-    print(f"Results: {output_dir.resolve()}")
-    print()
-
-    rows = []
-    total = len(args.models) * len(CASES) * args.repeats
-    current = 0
-
-    for model in args.models:
-        if model not in available:
-            message = f"Model not found in Ollama: {model}"
-            if args.skip_missing:
-                print(f"SKIP: {message}")
-                continue
-            print(f"WARNING: {message}; requests may fail.")
-        print(f"\n{'=' * 76}\nMODEL: {model}\n{'=' * 76}")
-
-        for repeat in range(1, args.repeats + 1):
-            for case in CASES:
-                current += 1
-                print(
-                    f"[{current}/{total}] {model} | {case['id']} "
-                    f"| repeat {repeat}/{args.repeats}",
-                    flush=True,
-                )
-                metrics = run_case(args.url, model, case, args)
-                record = {
-                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    "model": model,
-                    "case_id": case["id"],
-                    "domain": case["domain"],
-                    "repeat": repeat,
-                    **metrics,
-                }
-                rows.append(record)
-
-                with jsonl_path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-                speed = (
-                    f"{metrics['tokens_per_second']} tok/s"
-                    if metrics["tokens_per_second"] is not None else "n/a"
-                )
-                print(
-                    f"  {metrics['status']} | {metrics['wall_seconds']}s "
-                    f"| {speed}"
-                    + (f" | {metrics['error']}" if metrics["error"] else ""),
-                    flush=True,
-                )
-                time.sleep(args.pause)
-
-    fieldnames = [
-        "timestamp_utc", "model", "case_id", "domain", "repeat", "status",
-        "wall_seconds", "load_seconds", "prompt_tokens", "generated_tokens",
-        "generation_seconds", "tokens_per_second", "response", "error",
-        "human_score_0_to_4", "critical_error", "review_notes",
-    ]
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
-
-    print("\nCompleted.")
-    print(f"JSONL: {jsonl_path.resolve()}")
-    print(f"CSV:   {csv_path.resolve()}")
-    print("CSV includes blank columns for manual scientific scoring.")
-
-
-if __name__ == "__main__":
-    main()
